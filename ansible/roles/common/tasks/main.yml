@@ -1,0 +1,38 @@
+---
+- name: Update system
+  ansible.builtin.apt:
+    update_cache: true
+    upgrade: dist
+    cache_valid_time: 3600
+
+- name: Install dependencies
+  ansible.builtin.apt:
+    name:
+      - curl
+      - htop
+      - ufw
+      - fail2ban
+      - python3-docker
+    state: present
+
+- name: Configure firewall rules
+  community.general.ufw:
+    rule: allow
+    port: "{{ item }}"
+    proto: tcp
+  loop:
+    - "22"
+    - "443"
+
+- name: Enable firewall
+  community.general.ufw:
+    state: enabled
+    policy: deny
+    direction: incoming
+
+- name: Secure SSH
+  ansible.builtin.lineinfile:
+    path: /etc/ssh/sshd_config
+    regexp: "^#?PasswordAuthentication"
+    line: "PasswordAuthentication no"
+  notify: Restart SSH

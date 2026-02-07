@@ -1,0 +1,563 @@
+#!/bin/bash
+
+# ORK
+# Property of the Horde. No elfs allowed.
+
+set -Eeuo pipefail
+
+ORK_VERSION="0.1"
+
+# --- Main Execution ---
+
+main() {
+  trap cleanup ERR INT
+
+  SCRIPT_NAME="${0##*/}"
+  ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  
+  # Configuration defaults
+  : "${ORK_TF_VERSION:="1.14.4"}"
+  : "${ORK_HCLOUD_TOKEN:=""}"
+  : "${ORK_ANSIBLE_VERSION:="2.20.2"}"
+  : "${ORK_SSH_USER:="x3"}"
+  : "${ORK_SSH_KEY_PATH:="${ROOT_DIR}/.ssh/id_ed25519"}"
+  : "${ORK_ANSIBLE_PATH:="ansible"}"
+  : "${ORK_TF_INTERNAL:="0"}"
+
+  # Paths
+  DATA_DIR="${ROOT_DIR}/data"
+  SENSITIVE_CONFIGS="${DATA_DIR}/configs"
+  SENSITIVE_SECRETS="${DATA_DIR}/secrets"
+  USERS_FILE="${DATA_DIR}/users.list"
+  AUTH_FILE="${ROOT_DIR}/.secrets"
+
+  TF_SRC_DIR="${ROOT_DIR}/terraform"
+  ANSIBLE_DIR="${ROOT_DIR}/ansible"
+  VENV_DIR="${ANSIBLE_DIR}/.ansible/ansible_venv"
+  TF_LOCAL_BIN="${TF_SRC_DIR}/.bin/terraform"
+
+  # Expand home dir in key path immediately for local use
+  ORK_SSH_KEY_PATH="${ORK_SSH_KEY_PATH/#\~/$HOME}" 
+  if [[ "$ORK_SSH_KEY_PATH" != /* ]]; then
+      ORK_SSH_KEY_PATH="${ROOT_DIR}/${ORK_SSH_KEY_PATH}"
+  fi
+
+  export ORK_SSH_KEY_PATH
+
+  while [[ $# -gt 0 ]]; do
+    case $1 in
+    dab)
+      shift 1
+      subcmd_dab "$@"
+      exit $?
+      ;;
+    zug)
+      shift 1
+      subcmd_zug "$@"
+      exit $?
+      ;;
+    die)
+      shift 1
+      subcmd_die "$@"
+      exit $?
+      ;;
+    lok)
+      shift 1
+      subcmd_lok "$@"
+      exit 0
+      ;;
+    help|--help|-h)
+      get_help
+      exit 0
+      ;;
+    *)
+      cprintf_err "Unknown command: [bold][blue]$1[/blue][/bold]. Use [bold][green]help[/green][/bold] for usage."
+      exit 1
+      ;;
+    esac
+  done
+
+  if [[ $# -eq 0 ]]; then
+    cprintf_info "Use [bold][green]help[/green][/bold] for available commands."
+    exit 1
+  fi
+}
+
+cleanup() {
+  if [[ "${VIRTUAL_ENV:-}" != "" ]]; then
+      deactivate 2>/dev/null || true
+  fi
+}
+
+# --- Logging & Formatting ---
+
+: ${USE_COLOR:=false}
+
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ] && [ "${TERM:-}" != "dumb" ]; then
+  USE_COLOR=true
+fi
+
+cprintf() {
+  local text="${1:-}"
+
+  if ! ${USE_COLOR}; then
+    text=$(sed -E 's|\[/?[a-zA-Z_]+]||g' <<< "$text")
+    printf '%s\n' "$text"
+    return
+  fi
+
+  local ESC=$'\033'
+
+  text=$(sed -E \
+    -e "s|\[bold\]|${ESC}[1m|g" \
+    -e "s|\[/bold\]|${ESC}[22m|g" \
+    -e "s|\[italic\]|${ESC}[3m|g" \
+    -e "s|\[/italic\]|${ESC}[23m|g" \
+    -e "s|\[underline\]|${ESC}[4m|g" \
+    -e "s|\[/underline\]|${ESC}[24m|g" \
+    -e "s|\[blink\]|${ESC}[5m|g" \
+    -e "s|\[/blink\]|${ESC}[25m|g" \
+    \
+    -e "s|\[red\]|${ESC}[31m|g" \
+    -e "s|\[/red\]|${ESC}[39m|g" \
+    -e "s|\[green\]|${ESC}[32m|g" \
+    -e "s|\[/green\]|${ESC}[39m|g" \
+    -e "s|\[yellow\]|${ESC}[33m|g" \
+    -e "s|\[/yellow\]|${ESC}[39m|g" \
+    -e "s|\[blue\]|${ESC}[34m|g" \
+    -e "s|\[/blue\]|${ESC}[39m|g" \
+    -e "s|\[magenta\]|${ESC}[35m|g" \
+    -e "s|\[/magenta\]|${ESC}[39m|g" \
+    -e "s|\[cyan\]|${ESC}[36m|g" \
+    -e "s|\[/cyan\]|${ESC}[39m|g" \
+    -e "s|\[white\]|${ESC}[37m|g" \
+    -e "s|\[/white\]|${ESC}[39m|g" \
+    -e "s|\[gray\]|${ESC}[90m|g" \
+    -e "s|\[/gray\]|${ESC}[39m|g" \
+    <<< "$text")
+
+  printf '%b\n' "$text"
+}
+
+cprintf_err() {
+  cprintf "[bold][red]ERROR[/red][/bold]: $1" >&2
+}
+
+cprintf_warn() {
+  cprintf "[bold][yellow]WARN[/yellow][/bold]: $1" >&2
+}
+
+cprintf_done() {
+  cprintf "[bold][green]OK[/green][/bold]:   $1"
+}
+
+cprintf_info() {
+  cprintf "[bold][cyan]INFO[/cyan][/bold]: $1"
+}
+
+# --- Helpers ---
+
+check_dependencies() {
+  local -a REQUIRED_BINS=(
+    unzip
+    curl
+    python3
+    openssl
+    sed
+  )
+
+  local -a missing_bins=()
+  for bin in "${REQUIRED_BINS[@]}"; do
+    if ! command -v "$bin" > /dev/null 2>&1; then
+      missing_bins+=("$bin")
+    fi
+  done
+
+  if [[ ${#missing_bins[@]} -ne 0 ]]; then
+    cprintf_err "Missing required binaries: [bold]${missing_bins[*]}[/bold]"
+    exit 1
+  fi
+}
+
+init_fs() {
+  mkdir -p "$DATA_DIR" "$SENSITIVE_CONFIGS" "$SENSITIVE_SECRETS"
+  if [[ ! -f "$AUTH_FILE" ]]; then
+      touch "$AUTH_FILE"
+      chmod 600 "$AUTH_FILE"
+  fi
+  if [[ ! -f "$USERS_FILE" ]]; then
+      touch "$USERS_FILE"
+  fi
+}
+
+load_and_export() {
+  if [[ -f "$AUTH_FILE" ]]; then
+      set -a
+      source "$AUTH_FILE"
+      set +a
+  fi
+
+  export TF_VAR_hcloud_token="${ORK_HCLOUD_TOKEN:-}"
+  export TF_VAR_ssh_private_key_path="${ORK_SSH_KEY_PATH}"
+}
+
+ensure_secrets() {
+  if [[ ! -d "$DATA_DIR" ]] || [[ ! -f "$USERS_FILE" ]]; then
+      cprintf_err "Project not initialized (missing data folder or users.list)."
+      cprintf "Run [bold]'./ork dab'[/bold] to prepare the environment."
+      exit 1
+  fi
+
+  if [[ ! -f "$AUTH_FILE" ]]; then
+      cprintf_err "Secrets file not found ($AUTH_FILE)."
+      cprintf "Run [bold]'./ork dab'[/bold] to initialize."
+      exit 1
+  fi
+  
+  load_and_export
+  
+  local missing=false
+  for key in ORK_HCLOUD_TOKEN ORK_PANEL_USERNAME ORK_PANEL_PASSWORD; do
+      if [[ -z "${!key:-}" ]]; then
+          cprintf_warn "Missing variable: [bold]$key[/bold]"
+          missing=true
+      fi
+  done
+  
+  if [[ "$missing" == "true" ]]; then
+      cprintf_err "Configuration incomplete. Run [bold]'./ork dab'[/bold] to fix it."
+      exit 1
+  fi
+
+  if [[ ! -f "$ORK_SSH_KEY_PATH" ]]; then
+       cprintf_warn "SSH Key file not found at: [bold]$ORK_SSH_KEY_PATH[/bold]"
+       cprintf "Configure keys or run [bold]'./ork dab'[/bold] to re-check."
+  fi
+}
+
+configure_secrets() {
+  # init_fs call removed as it is now in dab
+  
+  if [[ -f "$AUTH_FILE" ]]; then
+      set -a
+      source "$AUTH_FILE"
+      set +a
+  fi
+  
+  local updated=false
+  
+  for key in ORK_HCLOUD_TOKEN ORK_PANEL_USERNAME ORK_PANEL_PASSWORD; do
+      if [[ -z "${!key:-}" ]]; then
+          read -p "Enter $key: " val
+          echo "$key=\"$val\"" >> "$AUTH_FILE"
+          updated=true
+      fi
+  done
+  
+  if [[ "$updated" == "true" ]]; then
+      set -a
+      source "$AUTH_FILE"
+      set +a
+  fi
+
+  load_and_export
+
+  if [[ ! -f "$ORK_SSH_KEY_PATH" ]]; then
+       cprintf_warn "SSH Key file not found at: [bold]$ORK_SSH_KEY_PATH[/bold]"
+       read -p "Generate new SSH key (ed25519) at $ORK_SSH_KEY_PATH? (y/N): " gen
+       if [[ "$gen" =~ ^[Yy]$ ]]; then
+           mkdir -p "$(dirname "$ORK_SSH_KEY_PATH")"
+           ssh-keygen -t ed25519 -f "$ORK_SSH_KEY_PATH" -N "" -C "ork-key"
+           cprintf_done "Key generated."
+       else
+           cprintf_warn "You need to provide a key manually."
+       fi
+  fi
+}
+
+prepare_terraform() {
+  if [[ "${ORK_TF_INTERNAL:-0}" == "1" ]] || ! command -v terraform >/dev/null 2>&1; then
+      if [[ ! -x "$TF_LOCAL_BIN" ]]; then
+          cprintf_info "Forging Hammer (Downloading Terraform [bold]${ORK_TF_VERSION}[/bold])..."
+          mkdir -p "$(dirname "$TF_LOCAL_BIN")"
+          local arch=$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')
+          local url="https://releases.hashicorp.com/terraform/${ORK_TF_VERSION}/terraform_${ORK_TF_VERSION}_linux_${arch}.zip"
+          curl -sL "$url" -o "/tmp/tf.zip" && unzip -q "/tmp/tf.zip" -d "$(dirname "$TF_LOCAL_BIN")" && rm "/tmp/tf.zip"
+          chmod +x "$TF_LOCAL_BIN"
+      fi
+      TF_CMD="$TF_LOCAL_BIN"
+  else
+      TF_CMD="terraform"
+  fi
+}
+
+setup_ansible_env() {
+  cprintf_info "Sharpening Axe (Checking Ansible)..."
+  
+  if [[ ! -d "$VENV_DIR" ]]; then
+      cprintf_info "Building Burrow (venv)..."
+      python3 -m venv "$VENV_DIR"
+  fi
+
+  source "$VENV_DIR/bin/activate"
+
+  if ! command -v ansible-playbook >/dev/null 2>&1; then
+      cprintf_info "Training Grunts (Installing Ansible [bold]${ORK_ANSIBLE_VERSION}[/bold])..."
+      pip install --upgrade pip
+      pip install ansible==${ORK_ANSIBLE_VERSION}
+  else
+      cprintf_done "Axe ready."
+  fi
+  deactivate
+}
+
+get_instance_ip() {
+  local ip
+  ip=$($TF_CMD -chdir="$TF_SRC_DIR" output -raw -no-color vpn_ip 2>/dev/null | tr -d '[:space:]"')
+  
+  if [[ -z "$ip" || ! "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+      $TF_CMD -chdir="$TF_SRC_DIR" refresh >/dev/null 2>&1
+      ip=$($TF_CMD -chdir="$TF_SRC_DIR" output -raw -no-color vpn_ip 2>/dev/null | tr -d '[:space:]"')
+  fi
+  echo "$ip"
+}
+
+wait_ssh() {
+  local ip=$1
+  
+  if [[ ! "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+      cprintf_err "Invalid IP: [$ip]"
+      exit 1
+  fi
+
+  cprintf_info "Waiting for SSH on [bold]$ip[/bold]..."
+  for i in {1..60}; do
+      if timeout 2 bash -c "echo > /dev/tcp/$ip/22" >/dev/null 2>&1; then
+          echo ""
+          cprintf_done "SSH available."
+          sleep 2
+          return 0
+      fi
+      echo -n "."
+      sleep 2
+  done
+  echo ""
+  return 1
+}
+
+run_ansible() {
+  local ip=$1
+  local playbook=$2
+
+  if [[ ! -f "$ORK_SSH_KEY_PATH" ]]; then
+      cprintf_err "Key not found: [bold]$ORK_SSH_KEY_PATH[/bold]"
+      exit 1
+  fi
+
+  source "$VENV_DIR/bin/activate"
+  
+  cprintf_info "Running playbook: [bold]$playbook[/bold]"
+  
+  export ANSIBLE_CONFIG="${ANSIBLE_DIR}/ansible.cfg"
+  export ANSIBLE_HOST_KEY_CHECKING=False
+
+  ansible-playbook -i "$ip," -u "$ORK_SSH_USER" \
+      --private-key "$ORK_SSH_KEY_PATH" \
+      -e "ansible_python_interpreter=/usr/bin/python3" \
+      -e "panel_username=$ORK_PANEL_USERNAME" \
+      -e "panel_password=$ORK_PANEL_PASSWORD" \
+      -e "users_file_path=$USERS_FILE" \
+      -e "local_keys_file=${DATA_DIR}/secrets/server_keys.json" \
+      -e "local_secrets_file=${DATA_DIR}/secrets/users.json" \
+      -e "configs_output_dir=${DATA_DIR}/configs" \
+      "${ANSIBLE_DIR}/${playbook}"
+}
+
+# --- Subcommands ---
+
+subcmd_dab() {
+  check_dependencies
+  init_fs
+  configure_secrets
+  cprintf_info "Dabu! (Initializing tools)..."
+  prepare_terraform
+  $TF_CMD -chdir="$TF_SRC_DIR" init
+  setup_ansible_env
+  cprintf_done "Job's done! Ready to serve."
+}
+
+subcmd_zug() {
+  check_dependencies
+  ensure_secrets
+  
+  local USERS_ONLY=false
+
+  while [[ $# -gt 0 ]]; do
+    case $1 in
+    --peon)
+      USERS_ONLY=true
+      shift 1
+      ;;
+    *)
+      cprintf "[red]Unknown option[/red]: [bold][blue]$1[/blue][/bold]"
+      exit 1
+      ;;
+    esac
+  done
+
+  local user_count=0
+  if [[ -f "$USERS_FILE" ]]; then
+      user_count=$(grep -vE '^\s*#|^\s*$' "$USERS_FILE" | wc -l)
+  fi
+
+  if [[ "$user_count" -eq 0 ]]; then
+      cprintf_warn "No users found in [bold]${USERS_FILE}[/bold]."
+      cprintf_warn "This will [bold][red]REMOVE ALL USERS[/red][/bold] from the server!"
+      read -p "Continue? (y/N): " c
+      if [[ ! "$c" =~ ^[Yy]$ ]]; then
+          exit 0
+      fi
+  fi
+
+  prepare_terraform
+  
+  local ip=""
+  
+  if $USERS_ONLY; then
+      cprintf_info "Only peons (users) work today..."
+      ip=$(get_instance_ip)
+  else
+      cprintf_info "Building ziggurat (Syncing infra)..."
+      
+      if ! $TF_CMD -chdir="$TF_SRC_DIR" apply -auto-approve -var="ssh_private_key_path=$ORK_SSH_KEY_PATH"; then
+          cprintf_err "Terraform failed."
+          exit 1
+      fi
+      
+      ip=$(get_instance_ip)
+  fi
+
+  wait_ssh "$ip" || exit 1
+
+  [[ ! -d "$VENV_DIR" ]] && setup_ansible_env
+
+  local playbook="deploy.yml"
+  if $USERS_ONLY; then
+      playbook="manage.yml"
+  fi
+
+  if run_ansible "$ip" "$playbook"; then
+      cprintf_done "Zug-zug! Success: [bold]$ip[/bold]"
+  else
+      cprintf_err "Ansible failed."
+      exit 1
+  fi
+}
+
+subcmd_die() {
+  check_dependencies
+  ensure_secrets
+  
+  local FORCE=false
+  local ASH=false
+  
+  while [[ $# -gt 0 ]]; do
+    case $1 in
+    -f|--force)
+      FORCE=true
+      shift 1
+      ;;
+    --ash)
+      ASH=true
+      shift 1
+      ;;
+    *)
+      cprintf "[red]Unknown option[/red]: [bold][blue]$1[/blue][/bold]"
+      exit 1
+      ;;
+    esac
+  done
+  
+  if ! $FORCE; then
+      read -p "Kill it? (y/N): " c
+      if [[ ! "$c" =~ ^[Yy]$ ]]; then
+          exit 0
+      fi
+  fi
+
+  prepare_terraform
+  $TF_CMD -chdir="$TF_SRC_DIR" destroy -auto-approve -var="ssh_private_key_path=$ORK_SSH_KEY_PATH"
+  
+  if $ASH; then
+      rm -rf "${DATA_DIR:?}/"*
+      cprintf_info "Left only ash (Local data cleared)."
+      init_fs
+  fi
+  cprintf_done "Dead."
+}
+
+subcmd_lok() {
+  cprintf "[bold][red]
+                      ▄▄▄  ▄ •▄ 
+                ▪     ▀▄ █·█▌▄▌▪
+                 ▄█▀▄ ▐▀▀▄ ▐▀▀▄·
+                ▐█▌.▐▌▐█•█▌▐█.█▌
+                 ▀█▄▀▪.▀  ▀·▀  ▀[/red][/bold][green]
+                  ⢀⣤⣶⣾⣿⣿⣷⣿⣾⣶⣦⣄⣀                   
+               ⣠⣾⣿⢿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣤                 
+             ⢀⣾⣿⣆⢠⣹⣿⢽⣿⣷⣿⣿⡿⣿⣿⣯⣉⠿⡘⣿⣿⣿               
+            ⣴⣿⣿⣿⣿⣿⣼⣿⣿⢿⣿⣯⣿⣿⣥⣟⣿⡿⢶⣭⣀⠎⣿⣿              
+           ⣶⣿⣿⣿⣿⣿⣿⡿⢂⠽⣿⢻⣿⣯⣸⣃⣈⡵⣓⠯⣯⣒⣀⣿⢿⣇             
+  ⣀       ⢀⣿⣿⣿⣿⣿⣿⣟⣉⣉⠻⣾⣻⠹⠏⠡⡶⠛⢓⣀⡅⢄⡄⠂⣬⣿⣿⠄      ⣀⣶⡾⠈  
+  ⠙⣶⣰⣦⢀   ⣾⣿⠛⣿⣿⣿⣿⣿⣿⣿⣿⣎⢿⣿⣼⢘⡁⣿⣿⣿⣿⠟ ⢈⣰⠏⢙⡇  ⢀⣠⣶⣿⠟⣿⠁   
+   ⠈⣿⣿⣿⣷⣶⣿⣿⡈⠙⣿⣿⢻⣿⣛⣿⣿⣿⢻⡆⠓⢋⢘⣽⣿⣿⣿⠟⡗⠽⢜⣋⠖⠉⠑⠚⠿⣿⠟⠁ ⡟     
+    ⣿⣿⡿⣿⡿⢘⢿⣿⣄    ⠁ ⣛⢌⠿ ⠃⠁⠿⡟⢀ ⢀⠐⠈  ⢀ ⠃⡆⢄⢀ ⠂ ⣿⠋     
+    ⠈⠛⣿⡟⡃⡔⣿⣟⢿⣮⡒ [/green][red]⠙⠛[/red][green]  ⣀ ⣋⠁⠒⢠  [/green][red]⠘⠛⠁[/red][green]⢀⠉ ⢀⠢⢸⠈⠐⢠⠁ ⡟       
+    ⢰⣾⣿⠂⢰⣾⣻⣋⣴⣿⣿⣷⣶⣤⢠⣿⠿⣿⣿⣿⣿⣶⣶⣷⡌⢀⣠⣤⣶⣿⡿⣁⠊ ⠌⠠⢰⠋        
+    ⢹⣿⣡⠇⡶⠉⠐⠤⠫⠉⠉⣩⢸⣿⣤⣠⣀⠈⣿⣿⡿⠛⠉⢹⠃⢨⡟⠉⠋   ⠈⠁  ⡟         
+    ⠈⣿⠇⢀[/green][white]⣷[/white][green]⠘⣤⠁⢆⣴⡛ ⣤⣽⢾⢿⣿⣀   ⠄⢈⣤⣷⣾⠏⠤⢊⡙⠉⡠⡞⣠ ⡿          
+   ⢀⣾⡿⠃⠂[/green][white]⣿⣷[/white][green]⠘⣄⠳⢳⢿⡘⣿⣿⠾⡸⣿⣿⣷⣰⣶⣆⣿⣻⡟⠃⣴⠋⢀⢠⢙⠁[/green][white]⢀⡆[/white][green]⡌           
+  ⠰⣿⢹⠉  [/green][white]⣿⣿⣷[/white][green]⠘ ⠈⣧⣧⢉⢉   ⠈  ⠉⠙⠛⠛ ⣾ ⠂⣴⢁⠃[/green][white]⢀⣿⣇[/white][green]⠸           
+   ⠻⠂⣸  [/green][white]⢿⣿⣿⣷⡄[/white][green]⠧⣤[/green][white]⣿[/white][green]⠙[/green][white]⣼[/white][green] ⠸⠈[/green][white]⣄[/white][green]⠃[/green][white]⢀⣠⡀[/white][green] ⠻⠛⠻⠁  [/green][white] ⣴⣿⣿⡏[/white][green] ⢻          
+    ⠙⢿⣧ ⠄[/green][white]⣿⣿⣿⣿⣤⣾⣿⢸⣿⣲⣿⣿⣿⡇⠓⣿⣿⢾⣷⣿⣶⣾⣥⣷⢿⣿⣿⠟[/white][green]⢀⣀⠘⡄         
+     ⠘⣿ ⠈⠊[/green][white]⠻⠿⠿⢛⣈⠉⣚⢛⠛⣛⣉⣛⢁⠹⠿⣛⡇⣛⣻⠟⠃⠻⠛⠙⣻⠑ [/white][green]⢃⣷⡄⣟         
+      ⢿ ⢤⠾⣿⡟⢿⣿⣿⡿⠟⠻⠻⠿⠿⠿⣿⣿⣿⣿⣲⣿⣿⣿⣿⡶⣶⣴⡈⣶⣝⣈⢻⣿⠁         
+      ⢺⡄⡸⢂⠙⠟⠋⠁            ⠉⠁ ⢉⡋⠉⠙⠿⠿⠉⢂ ⣿⠟          
+      ⢼⣯ ⠙  ⠄⠄⣀⣴⣿⣿⣿⣿⠿⣿⣷⣧⣷⣶⣔⢤⣀  ⠙⠕⠃⠁⠁ ⡿⠁           
+      ⠘⣿⣿⡍⣴⣞⠹⣻⣿⣿⣿⡟⠓ ⣾⣿⣿⡿⣿⣿⣿⣿⡗⣖⣗⠙ ⣤⢶ ⣾⠋            
+       ⠈⢿⣿⡇⡾⣾⣿⠓⣿⡿⠁ ⣰⡿⡿⢷⠗⡿⣋⣿⠿⣃⠿⠋⠂⡾⠡⡐⣸⠃             
+         ⠙⢟⣿⣕⣼⣇⡤⣾⣄ ⣿ ⠣⠁⠑⠒⠒⣉⠍⣒⢃⣔⠛⡥⠋⣖⠃              
+            ⠉⠉⠙⠛⠛⠛⠛⣿⣆⣖⡉⠉⠉⢉⡁⠄⠲⠛⠐⣠⣴⠛                
+                      ⠃⠓⠲⣲⣶⣩⠞⠙⠉[/green]
+
+                  LOK'TAR OGAR!
+             Property of the Horde.
+               No elfs allowed.
+                   ORK v ${ORK_VERSION}"
+}
+
+get_help() {
+  cprintf "[green]
+                          ▄▄▄  ▄ •▄ 
+                    ▪     ▀▄ █·█▌▄▌▪
+                     ▄█▀▄ ▐▀▀▄ ▐▀▀▄·
+                    ▐█▌.▐▌▐█•█▌▐█.█▌
+                     ▀█▄▀▪.▀  ▀·▀  ▀[/green]
+
+       [bold]Personal VLESS automation toolset (ORKestrator)[/bold]
+                        Version ${ORK_VERSION}
+
+  [bold]Usage:[/bold]
+    [green]$(basename "$0") <command> [options][/green]
+
+  [bold]Commands:[/bold]
+    [bold][blue]dab[/blue][/bold]      Dabu! (Init tools & deps)
+    [bold][blue]zug[/blue][/bold]      Zug-zug! (Full deploy/update)
+     [cyan]--peon[/cyan]  Just work with peons (Sync users only)
+    [bold][blue]die[/blue][/bold]      Kill it! (Destroy infrastructure)
+     [cyan]-f[/cyan]      Force (No mercy)
+     [cyan]--ash[/cyan]   Leave only ash (Full wipe: infra + local data)
+[/yellow]"
+}
+
+main "$@"

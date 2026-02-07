@@ -1,0 +1,101 @@
+---
+- name: Install GPG key
+  block:
+    - name: Ensure keyrings directory exists
+      ansible.builtin.file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: "0755"
+    - name: Download Docker GPG key
+      ansible.builtin.get_url:
+        url: https://download.docker.com/linux/ubuntu/gpg
+        dest: /etc/apt/keyrings/docker.asc
+        mode: "0644"
+
+- name: Add repository
+  ansible.builtin.copy:
+    dest: /etc/apt/sources.list.d/docker.list
+    # ИСПРАВЛЕНО: заменил ansible_distribution_release на ansible_facts['distribution_release']
+    content: >-
+      deb [arch={{ 'amd64' if ansible_facts['architecture'] == 'x86_64' else 'arm64' }} signed-by=/etc/apt/keyrings/docker.asc]
+      https://download.docker.com/linux/ubuntu {{ ansible_facts['distribution_release'] }} stable
+    mode: "0644"
+
+- name: Update cache
+  ansible.builtin.apt:
+    update_cache: true
+    force_apt_get: true
+  changed_when: false
+
+- name: Install packages
+  ansible.builtin.apt:
+    name:
+      - docker-ce
+      - docker-ce-cli
+      - containerd.io
+      - docker-compose-plugin
+    state: present
+
+- name: Enable service
+  ansible.builtin.service:
+    name: docker
+    state: started
+    enabled: true
+
+- name: Create directory
+  ansible.builtin.file:
+    path: /opt/3x-ui
+    state: directory
+    mode: "0755"
+    owner: "{{ ansible_user }}"
+    group: "{{ ansible_user }}"
+
+- name: Deploy compose
+  ansible.builtin.template:
+    src: docker-compose.yml.j2
+    dest: /opt/3x-ui/docker-compose.yml
+    mode: "0644"
+
+- name: Start stack
+  community.docker.docker_compose_v2:
+    project_src: /opt/3x-ui
+    state: present
+    pull: always
+  register: docker_deploy_compose_start
+
+- name: Wait for DB  # noqa: no-handler
+  ansible.builtin.pause:
+    seconds: 5
+  when: docker_deploy_compose_start.changed
+
+- name: Check auth status
+  ansible.builtin.stat:
+    path: /opt/3x-ui/.auth_done
+  register: docker_deploy_auth_marker
+
+- name: Configure credentials
+  when: not docker_deploy_auth_marker.stat.exists
+  block:
+    - name: Set credentials via CLI
+      ansible.builtin.command: >
+        docker exec 3x-ui /app/x-ui setting
+          -username {{ panel_username }}
+          -password {{ panel_password }}
+      changed_when: true
+    - name: Restart container
+      ansible.builtin.command: "docker restart -t 0 3x-ui"
+      changed_when: true
+    - name: Create marker file
+      ansible.builtin.file:
+        path: /opt/3x-ui/.auth_done
+        state: touch
+        mode: "0644"
+
+- name: Update user groups
+  ansible.builtin.user:
+    name: "{{ ansible_user }}"
+    groups: docker
+    append: true
+
+- name: Refresh connection
+  ansible.builtin.meta: reset_connection

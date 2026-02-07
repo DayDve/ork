@@ -1,0 +1,6 @@
+---
+- name: Deploy and Configure VPN
+  hosts: all
+  become: true
+  roles:
+    - vpn_manager

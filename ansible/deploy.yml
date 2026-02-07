@@ -1,0 +1,8 @@
+---
+- name: Deploy and Configure VPN
+  hosts: all
+  become: true
+  roles:
+    - common
+    - docker_deploy
+    - vpn_manager

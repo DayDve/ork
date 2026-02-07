@@ -1,0 +1,13 @@
+.secrets
+**/.terraform/
+**/*.tfstate
+**/*.tfstate.backup
+.ssh/
+**/.ansible/
+**/.terraform.lock.hcl
+terraform.tfstate
+
+data/
+
+
+terraform/.bin/

@@ -1,0 +1,338 @@
+---
+- name: Check local keys file
+  ansible.builtin.stat:
+    path: "{{ local_keys_file }}"
+  delegate_to: localhost
+  become: false
+  register: vpn_manager_local_keys_stat
+
+- name: Generate Keys on Remote
+  when: not vpn_manager_local_keys_stat.stat.exists
+  block:
+    - name: Generate Reality keys
+      ansible.builtin.shell: |
+        set -o pipefail
+        docker run --rm --entrypoint /usr/bin/xray teddysun/xray x25519 | \
+        awk -F': ' 'BEGIN {printf("{")} {printf("\"%s\": \"%s\",",$1,$2)} END {printf("}")}' | \
+        sed 's/,}/}/g'
+      register: vpn_manager_keygen_raw
+      changed_when: true
+
+    - name: Gen ShortID
+      ansible.builtin.command: "openssl rand -hex 4"
+      register: vpn_manager_shortid_out
+      changed_when: false
+
+    - name: Save keys locally
+      ansible.builtin.copy:
+        content: |
+          {
+            "private": "{{ (vpn_manager_keygen_raw.stdout | from_json).PrivateKey }}",
+            "public": "{{ (vpn_manager_keygen_raw.stdout | from_json).Password }}",
+            "short_id": "{{ vpn_manager_shortid_out.stdout | trim }}"
+          }
+        dest: "{{ local_keys_file }}"
+        mode: "0600"
+      delegate_to: localhost
+      become: false
+
+- name: Load local data (keys, secrets, users)
+  ansible.builtin.set_fact:
+    vpn_manager_srv_keys: >-
+      {{ lookup('file', local_keys_file) | from_json }}
+    vpn_manager_existing_db: >-
+      {{
+        lookup('file', local_secrets_file, errors='ignore')
+        | default('{}', true)
+        | from_json
+      }}
+    vpn_manager_vpn_users: >-
+      {{
+        lookup('file', users_file_path).splitlines()
+        | select('match', '^[^#]')
+        | map('trim')
+        | select
+        | list
+      }}
+  delegate_to: localhost
+  become: false
+
+- name: Generate fresh UUIDs for all users
+  ansible.builtin.command: uuidgen
+  register: vpn_manager_fresh_uuids
+  loop: "{{ vpn_manager_vpn_users }}"
+  changed_when: false
+  delegate_to: localhost
+  become: false
+
+- name: Build Users Map
+  ansible.builtin.set_fact:
+    vpn_manager_users_map: >-
+      {%- set results = {} -%} {%- for email in vpn_manager_vpn_users -%}
+        {%- set existing_id = vpn_manager_existing_db.get(email) -%}
+        {%- if existing_id -%}
+          {%- set _ = results.update({email: existing_id}) -%}
+        {%- else -%}
+          {%- set new_id = vpn_manager_fresh_uuids.results[loop.index0].stdout | trim -%}
+          {%- set _ = results.update({email: new_id}) -%}
+        {%- endif -%}
+      {%- endfor -%} {{ results }}
+  delegate_to: localhost
+  become: false
+
+- name: Save Updated Users Map
+  ansible.builtin.copy:
+    content: "{{ vpn_manager_users_map | to_nice_json }}"
+    dest: "{{ local_secrets_file }}"
+    mode: "0600"
+  delegate_to: localhost
+  become: false
+
+- name: Attempt API Login
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ panel_port }}/login"
+    method: POST
+    body_format: json
+    body:
+      username: "{{ panel_username }}"
+      password: "{{ panel_password }}"
+    status_code: [200, 401, 500]
+    return_content: true
+  register: vpn_manager_login_attempt
+  ignore_errors: true
+
+- name: Reset Password if Login Failed
+  when: >-
+    vpn_manager_login_attempt.status != 200
+    or not (vpn_manager_login_attempt.json.success | default(false))
+  block:
+    - name: Force Reset via Binary
+      ansible.builtin.command: >-
+        docker exec 3x-ui /app/x-ui setting
+        -username {{ panel_username }}
+        -password {{ panel_password }}
+      changed_when: true
+
+    - name: Restart Container
+      ansible.builtin.command: "docker restart 3x-ui"
+      changed_when: true
+
+    - name: Wait for container
+      ansible.builtin.pause:
+        seconds: 5
+
+    - name: Login Retry
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ panel_port }}/login"
+        method: POST
+        body_format: json
+        body:
+          username: "{{ panel_username }}"
+          password: "{{ panel_password }}"
+        status_code: 200
+        return_content: true
+      register: vpn_manager_login_retry
+
+    - name: Store Login Response
+      ansible.builtin.set_fact:
+        vpn_manager_login_response: "{{ vpn_manager_login_retry }}"
+
+- name: Set Login Fact
+  ansible.builtin.set_fact:
+    vpn_manager_login_response: "{{ vpn_manager_login_attempt }}"
+  when:
+    - vpn_manager_login_attempt.status == 200
+    - vpn_manager_login_attempt.json.success | default(false)
+
+- name: Get Inbounds List (GET)
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ panel_port }}/panel/api/inbounds/list"
+    method: GET
+    headers:
+      Cookie: "{{ vpn_manager_login_response.cookies_string }}"
+    return_content: true
+  register: vpn_manager_inbounds_list
+
+- name: Parse Existing Inbound
+  delegate_to: localhost
+  become: false
+
+  ansible.builtin.set_fact:
+    vpn_manager_target_inbound: >-
+      {{
+        vpn_manager_inbounds_list.json.obj
+        | selectattr('port', 'equalto', 443)
+        | first
+        | default(none)
+      }}
+
+- name: Create Inbound (POST)
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ panel_port }}/panel/api/inbounds/add"
+    method: POST
+    headers:
+      Cookie: "{{ vpn_manager_login_response.cookies_string }}"
+    body_format: json
+    body:
+      enable: true
+      remark: "VLESS-XHTTP"
+      port: 443
+      protocol: "vless"
+      settings: >-
+        {{
+          {
+            'clients': [],
+            'decryption': 'none',
+            'fallbacks': []
+          } | to_json
+        }}
+      streamSettings: >-
+        {{
+          {
+            'network': 'xhttp',
+            'security': 'reality',
+            'xhttpSettings': {
+              'path': '/',
+              'mode': 'auto'
+            },
+            'realitySettings': {
+              'show': false,
+              'dest': reality_dest,
+              'serverNames': [reality_sni],
+              'privateKey': vpn_manager_srv_keys.private,
+              'shortIds': [vpn_manager_srv_keys.short_id]
+            }
+          } | to_json
+        }}
+      sniffing: >-
+        {{
+          {
+            'enabled': true,
+            'destOverride': ['http', 'tls']
+          } | to_json
+        }}
+  when: vpn_manager_target_inbound is none
+  register: vpn_manager_inbound_created
+
+- name: Refresh Inbounds List
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ panel_port }}/panel/api/inbounds/list"
+    method: GET
+    headers:
+      Cookie: "{{ vpn_manager_login_response.cookies_string }}"
+  register: vpn_manager_inbounds_list_refresh
+  when: vpn_manager_target_inbound is none
+
+- name: Update Target Inbound Fact
+  ansible.builtin.set_fact:
+    vpn_manager_target_inbound: >-
+      {{
+        vpn_manager_inbounds_list_refresh.json.obj
+        | selectattr('port', 'equalto', 443)
+        | first
+      }}
+  when: vpn_manager_target_inbound is none
+
+- name: Get Current Clients Emails
+  ansible.builtin.set_fact:
+    vpn_manager_current_emails: >-
+      {{
+        (vpn_manager_target_inbound.settings | from_json).clients
+        | map(attribute='email')
+        | list
+      }}
+
+- name: Add Missing Clients (POST)
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ panel_port }}/panel/api/inbounds/addClient"
+    method: POST
+    headers:
+      Cookie: "{{ vpn_manager_login_response.cookies_string }}"
+    body_format: json
+    body:
+      id: "{{ vpn_manager_target_inbound.id }}"
+      settings: >-
+        {{
+          {
+            'clients': [
+              {
+                'id': vpn_manager_users_map[item],
+                'email': item,
+                'flow': '',
+                'enable': true
+              }
+            ]
+          } | to_json
+        }}
+  loop: "{{ vpn_manager_users_map.keys() }}"
+  when: item not in vpn_manager_current_emails
+
+- name: Map Server Clients (Email to UUID)
+  ansible.builtin.set_fact:
+    vpn_manager_server_clients_map: >-
+      {{
+        (vpn_manager_target_inbound.settings | from_json).clients
+        | items2dict(key_name='email', value_name='id')
+      }}
+
+- name: Remove Obsolete Clients (POST)
+  ansible.builtin.uri:
+    url: >-
+      http://127.0.0.1:{{ panel_port }}/panel/api/inbounds/delClient/{{ vpn_manager_target_inbound.id }}/{{ vpn_manager_server_clients_map[item] }}
+    method: POST
+    headers:
+      Cookie: "{{ vpn_manager_login_response.cookies_string }}"
+    body_format: json
+  loop: >-
+    {{
+      vpn_manager_server_clients_map.keys()
+      | difference(vpn_manager_users_map.keys())
+    }}
+
+- name: Ensure configs dir
+  ansible.builtin.file:
+    path: "{{ configs_output_dir }}"
+    state: directory
+    mode: "0700"
+  delegate_to: localhost
+  become: false
+
+- name: Generate Config Files
+  ansible.builtin.copy:
+    content: >-
+      {{
+        'vless://{}@{}:443?security=reality&encryption=none&pbk={}&headerType=none&type=xhttp&sni={}&sid={}&fp=chrome#{}'.format(
+          vpn_manager_users_map[item],
+          inventory_hostname,
+          vpn_manager_srv_keys.public,
+          reality_sni,
+          vpn_manager_srv_keys.short_id,
+          item
+        )
+      }}
+    dest: "{{ configs_output_dir }}/{{ item }}.txt"
+    mode: "0600"
+  loop: "{{ vpn_manager_users_map.keys() }}"
+  delegate_to: localhost
+  become: false
+
+- name: List existing config files
+  ansible.builtin.find:
+    paths: "{{ configs_output_dir }}"
+    patterns: "*.txt"
+  register: vpn_manager_existing_config_files
+  delegate_to: localhost
+  become: false
+
+- name: Remove obsolete config files
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: absent
+  when: >-
+    (item.path | basename | splitext | first)
+    not in vpn_manager_users_map.keys()
+  loop: "{{ vpn_manager_existing_config_files.files }}"
+  loop_control:
+    label: "{{ item.path | basename }}"
+  delegate_to: localhost
+  become: false
